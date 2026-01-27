@@ -1,0 +1,13 @@
+.env
+Read_Only_Kalshi_Key.txt
+Write_Kalshi_Key.txt
+*.pem
+
+#local
+__pycache__/
+volume_data/
+orderbook_data/
+logs/
+cache/
+volume_config.json
+DEVELOPER_NOTES.md
