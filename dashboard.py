@@ -238,95 +238,91 @@ volume_tracker = VolumeTracker()
 # Volume Recorder (CSV Export)
 # ─────────────────────────────────────────────────────────────────────────────
 class VolumeRecorder:
-    """Record volume data to CSV for tickers in volume_config (volume_yes, volume_no)."""
-    
+    """Record volume data to CSV for tickers in volume_config. One file per (ticker, interval).
+    Writes only when there is volume (skips zero-volume periods). Columns: timestamp_utc, volume_yes, volume_no.
+    """
+
     INTERVAL_SECONDS = {
-        '1s': 1,
-        '1m': 60,
-        '10m': 600,
-        '1h': 3600,
+        "1s": 1,
+        "1m": 60,
+        "10m": 600,
+        "1h": 3600,
     }
-    
+
     def __init__(self, config_path: str = None):
         self.config_path = config_path or os.path.join(script_dir, "volume_config.json")
         self.output_dir = os.path.join(script_dir, "volume_data")
         self.ticker_intervals = {}
         self.current_periods = {}
+        self.last_written_period = {}
         self._last_config_load = 0.0
         self._last_flush_ended = 0.0
         self._load_config()
-    
+
     def _load_config(self):
         """Load volume_config.json: tickers with 'volume' intervals."""
         try:
             if os.path.exists(self.config_path):
-                with open(self.config_path, 'r') as f:
+                with open(self.config_path, "r") as f:
                     config = json.load(f)
-                tickers_config = config.get('tickers', {})
-                self.ticker_intervals = {}
+                tickers_config = config.get("tickers", {})
+                new_intervals = {}
                 for ticker, raw in tickers_config.items():
                     if not isinstance(raw, dict):
                         continue
-                    intervals = raw.get('volume', []) or []
+                    intervals = raw.get("volume", []) or []
                     valid = [i for i in intervals if i in self.INTERVAL_SECONDS]
                     if valid:
-                        self.ticker_intervals[ticker] = valid
-                        if ticker not in self.current_periods:
-                            self.current_periods[ticker] = {}
-                        for iv in valid:
-                            if iv not in self.current_periods[ticker]:
-                                self.current_periods[ticker][iv] = {}
+                        new_intervals[ticker] = valid
+                self.ticker_intervals = new_intervals
+                for ticker, ivs in self.ticker_intervals.items():
+                    if ticker not in self.current_periods:
+                        self.current_periods[ticker] = {}
+                    if ticker not in self.last_written_period:
+                        self.last_written_period[ticker] = {}
+                    for iv in ivs:
+                        if iv not in self.current_periods[ticker]:
+                            self.current_periods[ticker][iv] = {}
+                        if iv not in self.last_written_period[ticker]:
+                            self.last_written_period[ticker][iv] = None
                 self._last_config_load = time.time()
         except (json.JSONDecodeError, IOError) as e:
             logger.warning("Failed to load volume config: %s", e)
-    
+
     def get_config_tickers(self) -> list:
         """Tickers with volume recording enabled (for WebSocket subscription)."""
         if time.time() - self._last_config_load > 60:
             self._load_config()
         return list(self.ticker_intervals.keys())
-    
+
     def _get_period_start(self, ts: int, interval: str) -> int:
-        """Get the start timestamp for the period containing ts."""
-        seconds = self.INTERVAL_SECONDS.get(interval, 1)
-        return (ts // seconds) * seconds
-    
-    def _get_ticker_file(self, ticker: str) -> str:
-        """Get the CSV file path for a ticker."""
-        # Ensure output directory exists
+        """Start timestamp for the period containing ts."""
+        sec = self.INTERVAL_SECONDS.get(interval, 1)
+        return (ts // sec) * sec
+
+    def _get_volume_file(self, ticker: str, interval: str) -> str:
         os.makedirs(self.output_dir, exist_ok=True)
-        return os.path.join(self.output_dir, f"{ticker}_volume_data.csv")
-    
-    def _write_csv_row(
-        self,
-        timestamp: int,
-        ticker: str,
-        interval: str,
-        volume_yes: int,
-        volume_no: int,
-    ):
-        """Write a single row to the ticker's CSV file. Timestamps are UTC."""
+        return os.path.join(self.output_dir, f"{ticker}_{interval}_volume.csv")
+
+    def _write_volume_row(self, timestamp: int, ticker: str, interval: str, volume_yes: int, volume_no: int):
+        """Write one row only when there is volume (skip zero-volume periods)."""
         if volume_yes == 0 and volume_no == 0:
             return
-        output_file = self._get_ticker_file(ticker)
-        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        day_of_week = dt.strftime("%A")
-        timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
-        file_exists = os.path.exists(output_file)
+        path = self._get_volume_file(ticker, interval)
+        ts_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        exists = os.path.exists(path)
         try:
-            with open(output_file, "a", newline="") as f:
+            with open(path, "a", newline="") as f:
                 w = csv.writer(f)
-                if not file_exists:
-                    w.writerow(
-                        ["ticker", "timestamp", "day_of_week", "interval", "volume_yes", "volume_no"]
-                    )
-                w.writerow([ticker, timestamp_str, day_of_week, interval, volume_yes, volume_no])
+                if not exists:
+                    w.writerow(["timestamp_utc", "volume_yes", "volume_no"])
+                w.writerow([ts_str, volume_yes, volume_no])
                 f.flush()
         except IOError as e:
-            logger.warning("Failed to write CSV row for %s: %s", ticker, e)
+            logger.warning("Failed to write volume CSV for %s %s: %s", ticker, interval, e)
 
     def record_trade(self, ticker: str, ts: int, count: int, side: str):
-        """Record a trade only for tickers in volume_config. side is 'yes' or 'no'."""
+        """Record a trade for tickers in volume_config. Writes happen in flush_ended_periods."""
         if not ticker or count <= 0:
             return
         if time.time() - self._last_config_load > 60:
@@ -338,62 +334,81 @@ class VolumeRecorder:
             return
         if ticker not in self.current_periods:
             self.current_periods[ticker] = {}
-        current_time = int(time.time())
         for interval in self.ticker_intervals[ticker]:
             if interval not in self.current_periods[ticker]:
                 self.current_periods[ticker][interval] = {}
-            period_start = self._get_period_start(ts, interval)
             periods = self.current_periods[ticker][interval]
-            old_periods = [p for p in periods if p < period_start]
-            for old_period in old_periods:
-                v = periods[old_period]
-                self._write_csv_row(old_period, ticker, interval, v["yes"], v["no"])
-                del periods[old_period]
+            period_start = self._get_period_start(ts, interval)
+            old = [p for p in periods if p < period_start]
+            for p in old:
+                del periods[p]
             if period_start not in periods:
                 periods[period_start] = {"yes": 0, "no": 0}
             periods[period_start][side] += count
-            sec = self.INTERVAL_SECONDS.get(interval, 1)
-            if sec >= 60 and (current_time - period_start) >= sec:
-                if period_start in periods:
-                    v = periods[period_start]
-                    if v["yes"] > 0 or v["no"] > 0:
-                        self._write_csv_row(period_start, ticker, interval, v["yes"], v["no"])
-                    del periods[period_start]
-    
+
     def flush_ended_periods(self):
-        """Write any ended periods (call periodically so we record even without new trades)."""
+        """Write ended periods that have volume (skip zero-volume). Throttled to 60s."""
         now = time.time()
         if now - self._last_flush_ended < 60:
             return
         self._last_flush_ended = now
         if now - self._last_config_load > 60:
             self._load_config()
-        current_time = int(now)
+        t = int(now)
         for ticker in list(self.ticker_intervals):
-            if ticker not in self.current_periods:
+            if ticker not in self.current_periods or ticker not in self.last_written_period:
                 continue
             for interval in self.ticker_intervals[ticker]:
-                if interval not in self.current_periods[ticker]:
-                    continue
-                periods = self.current_periods[ticker][interval]
                 sec = self.INTERVAL_SECONDS.get(interval, 1)
-                ended = [
-                    p for p in periods
-                    if (current_time - p) >= sec and (periods[p]["yes"] > 0 or periods[p]["no"] > 0)
-                ]
-                for p in ended:
-                    v = periods[p]
-                    self._write_csv_row(p, ticker, interval, v["yes"], v["no"])
-                    del periods[p]
+                last_completed = ((t // sec) * sec) - sec
+                last_w = self.last_written_period[ticker].get(interval)
+                periods = self.current_periods[ticker][interval]
+                if last_w is None:
+                    self.last_written_period[ticker][interval] = last_completed
+                    for p in list(periods):
+                        if p + sec <= t:
+                            del periods[p]
+                    continue
+                p = last_w + sec
+                while p <= last_completed:
+                    v = periods.get(p, {"yes": 0, "no": 0})
+                    self._write_volume_row(p, ticker, interval, v["yes"], v["no"])
+                    if p in periods:
+                        del periods[p]
+                    self.last_written_period[ticker][interval] = p
+                    p += sec
 
     def flush(self):
-        """Write any remaining data (call on shutdown)."""
-        for ticker in self.current_periods:
-            for interval in self.current_periods[ticker]:
-                for period_start, v in self.current_periods[ticker][interval].items():
-                    if v["yes"] > 0 or v["no"] > 0:
-                        self._write_csv_row(period_start, ticker, interval, v["yes"], v["no"])
-        self.current_periods = {}
+        """Write all ended periods then clear in-memory state (e.g. on shutdown)."""
+        if time.time() - self._last_config_load > 60:
+            self._load_config()
+        t = int(time.time())
+        for ticker in list(self.ticker_intervals):
+            if ticker not in self.current_periods or ticker not in self.last_written_period:
+                continue
+            for interval in self.ticker_intervals[ticker]:
+                sec = self.INTERVAL_SECONDS.get(interval, 1)
+                last_completed = ((t // sec) * sec) - sec
+                last_w = self.last_written_period[ticker].get(interval)
+                periods = self.current_periods[ticker][interval]
+                if last_w is None:
+                    self.last_written_period[ticker][interval] = last_completed
+                    for p in list(periods):
+                        if p + sec <= t:
+                            del periods[p]
+                    continue
+                p = last_w + sec
+                while p <= last_completed:
+                    v = periods.get(p, {"yes": 0, "no": 0})
+                    self._write_volume_row(p, ticker, interval, v["yes"], v["no"])
+                    if p in periods:
+                        del periods[p]
+                    self.last_written_period[ticker][interval] = p
+                    p += sec
+        self.current_periods = {
+            t: {i: {} for i in self.ticker_intervals.get(t, [])}
+            for t in self.ticker_intervals
+        }
 
 
 # Global volume recorder instance
@@ -404,47 +419,51 @@ volume_recorder = VolumeRecorder()
 # Orderbook Recorder (CSV Export)
 # ─────────────────────────────────────────────────────────────────────────────
 class OrderbookRecorder:
-    """Record orderbook snapshots to CSV for analysis."""
-    
+    """Record orderbook snapshots to CSV. One file per (ticker, interval).
+    Writes only when the orderbook has changed since last write (skips unchanged).
+    Columns: timestamp_utc, yes_bid, yes_ask, no_bid, spread, yes_depth, no_depth, yes_levels, no_levels.
+    """
+
     INTERVAL_SECONDS = {
-        '1s': 1,
-        '1m': 60,
-        '10m': 600,
-        '1h': 3600,
+        "1s": 1,
+        "1m": 60,
+        "10m": 600,
+        "1h": 3600,
     }
-    
+
     def __init__(self, config_path: str = None):
         self.config_path = config_path or os.path.join(script_dir, "volume_config.json")
         self.output_dir = os.path.join(script_dir, "orderbook_data")
         self.ticker_intervals = {}
         self.last_recorded = {}
-        self.last_config_load = 0
         self.last_snapshot = {}
+        self.last_config_load = 0.0
         self._load_config()
 
     def _load_config(self):
-        """Load or reload configuration from JSON file.
-        Format: {"tickers": {"TICKER": {"volume": ["1m", "10m"], "orderbook": ["10m"]}}}.
-        """
+        """Format: {"tickers": {"TICKER": {"volume": [...], "orderbook": ["1m", "10m"]}}}."""
         try:
             if os.path.exists(self.config_path):
-                with open(self.config_path, 'r') as f:
+                with open(self.config_path, "r") as f:
                     config = json.load(f)
-                tickers_config = config.get('tickers', {})
-                self.ticker_intervals = {}
+                tickers_config = config.get("tickers", {})
+                new_intervals = {}
                 for ticker, raw in tickers_config.items():
                     if not isinstance(raw, dict):
                         continue
-                    orderbook_intervals = raw.get('orderbook', []) or []
+                    orderbook_intervals = raw.get("orderbook", []) or []
                     valid = [i for i in orderbook_intervals if i in self.INTERVAL_SECONDS]
                     if valid:
-                        self.ticker_intervals[ticker] = valid
-                        if ticker not in self.last_recorded:
-                            self.last_recorded[ticker] = {}
-                        for interval in valid:
-                            if interval not in self.last_recorded[ticker]:
-                                self.last_recorded[ticker][interval] = 0
-                self.last_config_load = time.time()
+                        new_intervals[ticker] = valid
+                self.ticker_intervals = new_intervals
+                for ticker, ivs in self.ticker_intervals.items():
+                    if ticker not in self.last_recorded:
+                        self.last_recorded[ticker] = {}
+                    if ticker not in self.last_snapshot:
+                        self.last_snapshot[ticker] = {}
+                    for iv in ivs:
+                        if iv not in self.last_recorded[ticker]:
+                            self.last_recorded[ticker][iv] = 0
                 kept = {}
                 for t, ivs in self.ticker_intervals.items():
                     for i in ivs:
@@ -452,16 +471,15 @@ class OrderbookRecorder:
                         if prev is not None:
                             kept.setdefault(t, {})[i] = prev
                 self.last_snapshot = kept
+                self.last_config_load = time.time()
         except (json.JSONDecodeError, IOError) as e:
             logger.warning("Failed to load orderbook config: %s", e)
-    
-    def _get_ticker_file(self, ticker: str) -> str:
-        """Get the CSV file path for a ticker."""
+
+    def _get_orderbook_file(self, ticker: str, interval: str) -> str:
         os.makedirs(self.output_dir, exist_ok=True)
-        return os.path.join(self.output_dir, f"{ticker}_orderbook_data.csv")
+        return os.path.join(self.output_dir, f"{ticker}_{interval}_orderbook.csv")
 
     def _build_snapshot(self, orderbook_json: dict, bbo: dict):
-        """Build comparable snapshot (yes_bid, yes_ask, no_bid, spread, yes_depth, no_depth, yes_levels_str, no_levels_str)."""
         orderbook = orderbook_json.get("orderbook", {})
         yes_levels = orderbook.get("yes_dollars", [])
         no_levels = orderbook.get("no_dollars", [])
@@ -475,23 +493,18 @@ class OrderbookRecorder:
         no_levels_str = json.dumps(no_levels[:5]) if no_levels else "[]"
         return (yes_bid, yes_ask, no_bid, spread, yes_depth, no_depth, yes_levels_str, no_levels_str)
 
-    def _write_orderbook_row(self, timestamp: int, ticker: str, snapshot: tuple):
-        """Write orderbook snapshot to CSV. Timestamps are UTC. Uses csv.writer for safe quoting of JSON columns."""
-        output_file = self._get_ticker_file(ticker)
-        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        day_of_week = dt.strftime("%A")
-        timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S+00:00")
+    def _write_orderbook_row(self, timestamp: int, ticker: str, interval: str, snapshot: tuple):
+        path = self._get_orderbook_file(ticker, interval)
+        ts_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         yes_bid, yes_ask, no_bid, spread, yes_depth, no_depth, yes_levels_str, no_levels_str = snapshot
-        file_exists = os.path.exists(output_file)
+        exists = os.path.exists(path)
         try:
-            with open(output_file, "a", newline="") as f:
+            with open(path, "a", newline="") as f:
                 w = csv.writer(f)
-                if not file_exists:
+                if not exists:
                     w.writerow(
                         [
-                            "ticker",
-                            "timestamp",
-                            "day_of_week",
+                            "timestamp_utc",
                             "yes_bid",
                             "yes_ask",
                             "no_bid",
@@ -504,9 +517,7 @@ class OrderbookRecorder:
                     )
                 w.writerow(
                     [
-                        ticker,
-                        timestamp_str,
-                        day_of_week,
+                        ts_str,
                         yes_bid,
                         yes_ask,
                         no_bid,
@@ -519,22 +530,17 @@ class OrderbookRecorder:
                 )
                 f.flush()
         except IOError as e:
-            logger.warning("Failed to write orderbook CSV row for %s: %s", ticker, e)
+            logger.warning("Failed to write orderbook CSV for %s %s: %s", ticker, interval, e)
 
-    def should_record(self, ticker: str, interval: str, current_time: int) -> bool:
-        """Check if we should record orderbook for this ticker/interval."""
-        if ticker not in self.ticker_intervals:
+    def _should_record(self, ticker: str, interval: str, current_time: int) -> bool:
+        if ticker not in self.ticker_intervals or interval not in self.ticker_intervals[ticker]:
             return False
-        if interval not in self.ticker_intervals[ticker]:
-            return False
-        
-        interval_seconds = self.INTERVAL_SECONDS.get(interval, 1)
+        sec = self.INTERVAL_SECONDS.get(interval, 1)
         last_ts = self.last_recorded.get(ticker, {}).get(interval, 0)
-        
-        return (current_time - last_ts) >= interval_seconds
-    
+        return (current_time - last_ts) >= sec
+
     def record_orderbook(self, ticker: str, orderbook_json: dict, bbo: dict):
-        """Record orderbook snapshot only when interval has elapsed and the book has changed."""
+        """Record orderbook only when changed. Period-aligned timestamps."""
         if time.time() - self.last_config_load > 60:
             self._load_config()
         if ticker not in self.ticker_intervals:
@@ -542,15 +548,16 @@ class OrderbookRecorder:
         current_time = int(time.time())
         snapshot = self._build_snapshot(orderbook_json, bbo)
         for interval in self.ticker_intervals[ticker]:
-            if not self.should_record(ticker, interval, current_time):
+            if not self._should_record(ticker, interval, current_time):
                 continue
+            sec = self.INTERVAL_SECONDS.get(interval, 1)
+            aligned_ts = (current_time // sec) * sec
             last = self.last_snapshot.get(ticker, {}).get(interval)
             if last is not None and last == snapshot:
+                self.last_recorded[ticker][interval] = aligned_ts
                 continue
-            self._write_orderbook_row(current_time, ticker, snapshot)
-            if ticker not in self.last_recorded:
-                self.last_recorded[ticker] = {}
-            self.last_recorded[ticker][interval] = current_time
+            self._write_orderbook_row(aligned_ts, ticker, interval, snapshot)
+            self.last_recorded[ticker][interval] = aligned_ts
             if ticker not in self.last_snapshot:
                 self.last_snapshot[ticker] = {}
             self.last_snapshot[ticker][interval] = snapshot

@@ -1,10 +1,10 @@
 {
   "tickers": {
-    "EXAMPLE-TICKER-1": {
+    "EXAMPLE-EVENT": {
       "volume": ["1m", "10m"],
       "orderbook": ["1m"]
     },
-    "EXAMPLE-TICKER-2": {
+    "EXAMPLE-EVENT-2": {
       "volume": ["1m"],
       "orderbook": []
     }

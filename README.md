@@ -61,7 +61,7 @@ Example:
 ```json
 {
   "tickers": {
-    "YOUR-TICKER": {
+    "EXAMPLE-EVENT": {
       "volume": ["1m", "10m"],
       "orderbook": ["1m"]
     }
@@ -81,30 +81,50 @@ The GUI updates when each fetch cycle completes. Balance, market data, and order
 
 ## Data Recording
 
+One file per `(ticker, interval)`.
+
 ### Volume Recording
 
-Volume is recorded only for tickers listed in `volume_config.json` with a `volume` array. Data is written to `volume_data/{TICKER}_volume_data.csv` with columns:
-- `ticker` - Market ticker
-- `timestamp` - Period start time (UTC, `YYYY-MM-DD HH:MM:SS+00:00`)
-- `day_of_week` - Day name (for time-of-day analysis)
-- `interval` - Recording interval (1m, 10m, 1h)
-- `volume_yes` - Contracts traded on the YES side (taker side) in the period
-- `volume_no` - Contracts traded on the NO side (taker side) in the period
+Volume is recorded only for tickers in `volume_config.json` with a `volume` array. Files: `volume_data/{ticker}_{interval}_volume.csv` (e.g. `EXAMPLE-EVENT_1m_volume.csv`). A row is written only when there is volume in the period (zero-volume periods are skipped).
+
+**Format:** CSV, UTF-8. Header row, then one data row per record.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `timestamp_utc` | string | Period start (UTC, ISO 8601: `YYYY-MM-DDTHH:MM:SSZ`) |
+| `volume_yes` | int | Contracts traded on the YES side (taker) in the period |
+| `volume_no` | int | Contracts traded on the NO side (taker) in the period |
+
+Example:
+```csv
+timestamp_utc,volume_yes,volume_no
+2026-01-27T22:30:00Z,150,42
+2026-01-27T22:35:00Z,0,200
+```
 
 ### Orderbook Recording
 
-Orderbook snapshots are written to `orderbook_data/{TICKER}_orderbook_data.csv`. A row is written only when the orderbook has changed since the last write, to reduce file size. Columns:
-- `ticker` - Market ticker (enables merging multiple files for analysis)
-- `timestamp` - Snapshot time (UTC, `YYYY-MM-DD HH:MM:SS+00:00`)
-- `day_of_week` - Day name
-- `yes_bid` - Best YES bid (cents)
-- `yes_ask` - Best YES ask (cents)
-- `no_bid` - Best NO bid (cents)
-- `spread` - Bid-ask spread (cents)
-- `yes_depth` - Total contracts on YES side (top 5 levels)
-- `no_depth` - Total contracts on NO side (top 5 levels)
-- `yes_levels` - JSON array of top 5 YES price levels `[[price, contracts], ...]` (use `csv` reader for correct parsing)
-- `no_levels` - JSON array of top 5 NO price levels `[[price, contracts], ...]`
+Orderbook snapshots: `orderbook_data/{ticker}_{interval}_orderbook.csv` (e.g. `EXAMPLE-EVENT_1m_orderbook.csv`). A row is written only when the orderbook has changed since the last write.
+
+**Format:** CSV, UTF-8. Header row, then one data row per record. `yes_levels` and `no_levels` are JSON strings; use a CSV-aware reader (e.g. `csv` module or `pd.read_csv`) so quoted commas inside the JSON are handled correctly.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `timestamp_utc` | string | Snapshot time (UTC, ISO 8601: `YYYY-MM-DDTHH:MM:SSZ`) |
+| `yes_bid` | int | Best YES bid (cents) |
+| `yes_ask` | int | Best YES ask (cents) |
+| `no_bid` | int | Best NO bid (cents) |
+| `spread` | int | Bid-ask spread (cents) |
+| `yes_depth` | int | Total contracts on YES side (top 5 levels) |
+| `no_depth` | int | Total contracts on NO side (top 5 levels) |
+| `yes_levels` | string | JSON array `[[price, contracts], ...]` for top 5 YES levels (price in dollars) |
+| `no_levels` | string | JSON array `[[price, contracts], ...]` for top 5 NO levels (price in dollars) |
+
+Example:
+```csv
+timestamp_utc,yes_bid,yes_ask,no_bid,spread,yes_depth,no_depth,yes_levels,no_levels
+2026-01-27T22:37:00Z,32,33,67,1,2167,2809,"[[\"0.27\", 25], [\"0.29\", 2000]]","[[\"0.64\", 2000], [\"0.67\", 300]]"
+```
 
 ## File Structure
 
@@ -115,8 +135,8 @@ Orderbook snapshots are written to `orderbook_data/{TICKER}_orderbook_data.csv`.
 ├── gui.py                     # CustomTkinter GUI
 ├── volume_config.json.example # Example; copy for volume/orderbook recording (optional)
 ├── volume_config.json         # Volume and orderbook recording config (optional, user-created)
-├── volume_data/               # CSV output (auto-created)
-├── orderbook_data/            # Orderbook CSV output (auto-created)
+├── volume_data/               # Volume CSVs: e.g. EXAMPLE-EVENT_1m_volume.csv (auto-created)
+├── orderbook_data/            # Orderbook CSVs: e.g. EXAMPLE-EVENT_1m_orderbook.csv (auto-created)
 ├── logs/                      # Log files (auto-created)
 ├── cache/                     # Volume display cache (auto-created)
 ├── requirements.txt
