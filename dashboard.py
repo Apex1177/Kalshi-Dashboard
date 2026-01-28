@@ -938,7 +938,7 @@ def calculate_exposure(positions_resp, orders_list, queue_lookup, orderbooks=Non
     # Process resting orders
     for order in orders:
         status = get_attr(order, 'status')
-        ticker = get_attr(order, 'ticker')
+        ticker = get_attr(order, 'ticker') or get_attr(order, 'market_ticker')
         side = get_attr(order, 'side')
         action = get_attr(order, 'action')
         remaining = get_attr(order, 'remaining_count', 0)
@@ -952,6 +952,7 @@ def calculate_exposure(positions_resp, orders_list, queue_lookup, orderbooks=Non
         if ticker not in market_data:
             market_data[ticker] = init_market()
         
+        # Price for this order side; effective price for sells (YES sell = NO buy at 100-yes_price)
         price = yes_price if side == 'yes' else no_price
         order_dollars = remaining * price
         
@@ -972,7 +973,8 @@ def calculate_exposure(positions_resp, orders_list, queue_lookup, orderbooks=Non
         else:
             market_data[ticker]['no_queue_positions'].append(total_ahead)
         
-        # Track buy exposure (buys create exposure - will fill as market moves through)
+        # Exposure: treat SELL YES same as BUY NO, SELL NO same as BUY YES.
+        # Resting buys add exposure; resting sells add equivalent exposure (will fill as market moves).
         if action == 'buy':
             if side == 'yes':
                 market_data[ticker]['yes_resting_buy_dollars'] += order_dollars
@@ -980,6 +982,18 @@ def calculate_exposure(positions_resp, orders_list, queue_lookup, orderbooks=Non
             else:
                 market_data[ticker]['no_resting_buy_dollars'] += order_dollars
                 market_data[ticker]['no_resting_buy_contracts'] += remaining
+        elif action == 'sell':
+            # YES sell = NO buy at (100 - yes_price); NO sell = YES buy at (100 - no_price)
+            if side == 'yes':
+                effective_no_price = no_price if no_price else (100 - yes_price)
+                sell_dollars = remaining * effective_no_price
+                market_data[ticker]['no_resting_buy_dollars'] += sell_dollars
+                market_data[ticker]['no_resting_buy_contracts'] += remaining
+            else:
+                effective_yes_price = yes_price if yes_price else (100 - no_price)
+                sell_dollars = remaining * effective_yes_price
+                market_data[ticker]['yes_resting_buy_dollars'] += sell_dollars
+                market_data[ticker]['yes_resting_buy_contracts'] += remaining
     
     # Add BBO data
     for ticker in market_data:
@@ -1304,7 +1318,11 @@ async def fetch_dashboard_data(http_session: aiohttp.ClientSession) -> dict:
         if getattr(p, "ticker", None) and (getattr(p, "position", 0) or 0) != 0
     ]
     open_count = len(tickers_with_positions)
-    order_tickers = list(set(o.get("ticker") for o in orders_list if o.get("ticker")))
+    order_tickers = list(set(
+        (o.get("ticker") or o.get("market_ticker"))
+        for o in orders_list
+        if (o.get("ticker") or o.get("market_ticker"))
+    ))
     all_tickers = list(set(tickers_with_positions + order_tickers))
 
     # Evict orderbook cache for tickers we no longer track
