@@ -1208,6 +1208,31 @@ def save_volume_display_cache(rows: list) -> None:
         _save_volume_display_cache(rows)
 
 
+def _market_price_to_dollars(mkt: dict) -> float:
+    """
+    Get last-trade price in dollars from market dict.
+    Prefer last_price_dollars (fixed-point string); fallback last_price (cents or dollars).
+    Used for 24h $ estimate (volume_24h × price). Return 0.5 if missing.
+    """
+    v = mkt.get("last_price_dollars")
+    if v is not None and v != "":
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    v = mkt.get("last_price")
+    if v is not None:
+        try:
+            x = float(v)
+            if 0 < x <= 1:
+                return x
+            if 1 < x <= 100:
+                return x / 100.0
+        except (TypeError, ValueError):
+            pass
+    return 0.5
+
+
 def build_volume_data(tickers: list, market_data: dict = None) -> dict:
     """Build volume data structure for GUI.
     Uses live VolumeTracker when available; falls back to cached 1m–12h on startup (timestamps).
@@ -1244,8 +1269,8 @@ def build_volume_data(tickers: list, market_data: dict = None) -> dict:
 
         mkt = market_data.get(ticker, {})
         volume_24h = mkt.get("volume_24h", 0) or 0
-        last_price = mkt.get("last_price", 50) or 50
-        volume_24h_dollars = int(volume_24h * last_price)
+        price_dollars = _market_price_to_dollars(mkt)
+        volume_24h_dollars = int(round(volume_24h * price_dollars * 100))  # store cents for GUI
 
         rows.append({
             "ticker": ticker[:36],
