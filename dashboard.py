@@ -6,6 +6,7 @@ import base64
 import asyncio
 import logging
 import math
+from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from collections import deque
 from datetime import datetime, timezone
@@ -480,11 +481,11 @@ class OrderbookRecorder:
         return os.path.join(self.output_dir, f"{ticker}_{interval}_orderbook.csv")
 
     def _build_snapshot(self, orderbook_json: dict, bbo: dict):
-        orderbook = orderbook_json.get("orderbook", {})
+        orderbook = _get_orderbook(orderbook_json)
         yes_levels = orderbook.get("yes_dollars", [])
         no_levels = orderbook.get("no_dollars", [])
-        yes_depth = sum(int(level[1]) for level in yes_levels if level and len(level) >= 2) if yes_levels else 0
-        no_depth = sum(int(level[1]) for level in no_levels if level and len(level) >= 2) if no_levels else 0
+        yes_depth = sum(_parse_count(level[1]) for level in (yes_levels or []) if level and len(level) >= 2)
+        no_depth = sum(_parse_count(level[1]) for level in (no_levels or []) if level and len(level) >= 2)
         yes_bid = bbo.get("yes_bid", 0) if bbo else 0
         yes_ask = bbo.get("yes_ask", 0) if bbo else 0
         no_bid = bbo.get("no_bid", 0) if bbo else 0
@@ -769,7 +770,7 @@ async def websocket_trade_listener(tickers: list):
                                 if msg_type == 'trade':
                                     trade_msg = data.get('msg', {})
                                     ticker = trade_msg.get('market_ticker')
-                                    count = trade_msg.get('count', 0)
+                                    count = _parse_count(trade_msg.get('count_fp'))
                                     ts = trade_msg.get('ts', int(time.time()))
                                     side = (trade_msg.get('taker_side') or '').strip().lower()
                                     if side not in ('yes', 'no'):
@@ -838,53 +839,93 @@ def get_attr(obj, key, default=None):
     return default if val is None else val
 
 
-def get_contracts_ahead(orderbook_json: dict, side: str, action: str, my_price: int, bbo: dict) -> int:
+def _get_orderbook(orderbook_response: dict) -> dict:
+    """Return orderbook_fp only. Legacy orderbook is deprecated."""
+    if not orderbook_response or not isinstance(orderbook_response, dict):
+        return {}
+    ob_fp = orderbook_response.get("orderbook_fp")
+    if ob_fp and isinstance(ob_fp, dict):
+        return ob_fp
+    if not ob_fp:
+        logger.debug("Orderbook response missing orderbook_fp (legacy deprecated)")
+    return {}
+
+
+def _parse_price_dollars(val) -> Decimal:
+    """Parse price to Decimal dollars. Prefer fp '0.5600'; fallback legacy cents 1-100 -> /100."""
+    if val is None:
+        return Decimal("0")
+    try:
+        if isinstance(val, str):
+            x = Decimal(val)
+        else:
+            x = Decimal(str(val))
+        if Decimal("0") <= x <= Decimal("1"):
+            return x
+        if Decimal("1") < x <= Decimal("100"):
+            return x / 100  # Legacy cents format
+    except Exception:
+        pass
+    return Decimal("0")
+
+
+def _parse_count(val) -> int:
+    """Parse FixedPointCount to int. Format: '100.00', '100.0', '100'."""
+    if val is None:
+        return 0
+    try:
+        return int(Decimal(str(val)))
+    except (ValueError, TypeError):
+        return 0
+
+
+def get_contracts_ahead(orderbook_json: dict, side: str, action: str, my_price_dollars: Decimal, bbo: dict) -> int:
     """
     Calculate contracts ahead of your order in a binary market.
-    
+    Uses fixed-point orderbook; all prices in dollars (Decimal) for sub-penny accuracy.
+
     Binary market logic:
     - YES BUY at price X: competes with YES bids at prices > X
-    - YES SELL at price X: equivalent to NO BUY at (100-X), competes with NO bids > (100-X)
+    - YES SELL at price X: equivalent to NO BUY at (1-X), competes with NO bids > (1-X)
     - NO BUY at price X: competes with NO bids at prices > X
-    - NO SELL at price X: equivalent to YES BUY at (100-X), competes with YES bids > (100-X)
+    - NO SELL at price X: equivalent to YES BUY at (1-X), competes with YES bids > (1-X)
     """
     if not orderbook_json or not bbo:
         return 0
-    
-    orderbook = orderbook_json.get('orderbook', {})
+
+    orderbook = _get_orderbook(orderbook_json)
     if not orderbook:
         return 0
-    
-    # Determine which side of the orderbook to look at
-    if action == 'buy':
+
+    if action == "buy":
         book_side = side
-        effective_price = my_price
-        best_bid = bbo.get(f'{side}_bid', 0)
+        effective_price_dollars = my_price_dollars
     else:
-        # SELL = opposite side BUY (YES SELL = NO BUY)
-        book_side = 'no' if side == 'yes' else 'yes'
-        effective_price = 100 - my_price
-        best_bid = bbo.get(f'{book_side}_bid', 0)
-    
-    if effective_price >= best_bid:
+        book_side = "no" if side == "yes" else "yes"
+        effective_price_dollars = Decimal("1") - my_price_dollars
+
+    best_bid_dollars = bbo.get(f"{book_side}_bid_dollars")
+    if best_bid_dollars is None:
         return 0
-    
+    best_bid_dollars = Decimal(str(best_bid_dollars))
+    if effective_price_dollars >= best_bid_dollars:
+        return 0
+
     total_contracts = 0
-    price_levels = orderbook.get(f'{book_side}_dollars') or []
-    
+    price_levels = orderbook.get(f"{book_side}_dollars") or []
+
     for level in price_levels:
         if not level or len(level) < 2:
             continue
         try:
-            level_price_cents = int(float(level[0]) * 100)
-            level_count = int(level[1])
-            
-            if effective_price < level_price_cents <= best_bid:
+            level_price_dollars = _parse_price_dollars(level[0])
+            level_count = _parse_count(level[1])
+            if effective_price_dollars < level_price_dollars <= best_bid_dollars:
                 total_contracts += level_count
         except (ValueError, TypeError, IndexError) as e:
-            logger.debug(f"Orderbook level parse error: {e}")
+            logger.debug("Orderbook level parse error: %s", e)
             continue
-    
+
     return total_contracts
 
 
@@ -914,86 +955,133 @@ def calculate_exposure(positions_resp, orders_list, queue_lookup, orderbooks=Non
             'bbo': None
         }
     
-    # Process positions
+    # Process positions (fixed-point: position_fp, market_exposure_dollars; fallback market_exposure cents)
     for pos in positions:
-        ticker = getattr(pos, 'ticker', None)
+        ticker = get_attr(pos, "ticker", None) or get_attr(pos, "market_ticker", None)
         if not ticker:
             continue
-        position = getattr(pos, 'position', 0) or 0
-        market_exposure = getattr(pos, 'market_exposure', 0) or 0
-        realized_pnl = getattr(pos, 'realized_pnl', 0) or 0
-        
+        position_raw = get_attr(pos, "position_fp", None) or get_attr(pos, "position", None)
+        position = _parse_count(position_raw)
+        market_exposure_raw = get_attr(pos, "market_exposure_dollars", None)
+        if market_exposure_raw is not None:
+            try:
+                market_exposure = abs(int(Decimal(str(market_exposure_raw)) * 100))
+            except Exception:
+                market_exposure = None
+        else:
+            market_exposure = None
+        if market_exposure is None:
+            # Fallback: market_exposure in cents (integer)
+            market_exposure_cents = get_attr(pos, "market_exposure", None)
+            if market_exposure_cents is not None:
+                try:
+                    market_exposure = abs(int(market_exposure_cents))
+                except (TypeError, ValueError):
+                    continue
+            else:
+                continue
+        realized_pnl_raw = get_attr(pos, "realized_pnl_dollars")
+        if realized_pnl_raw is not None:
+            try:
+                realized_pnl = int(Decimal(str(realized_pnl_raw)) * 100)
+            except Exception:
+                realized_pnl = 0
+        else:
+            realized_pnl = 0
+
         if ticker not in market_data:
             market_data[ticker] = init_market()
-        
-        market_data[ticker]['realized_pnl'] = realized_pnl
-        
+
+        market_data[ticker]["realized_pnl"] = realized_pnl
+
         if position > 0:
-            market_data[ticker]['yes_inventory_dollars'] = market_exposure
-            market_data[ticker]['yes_inventory_contracts'] = position
+            market_data[ticker]["yes_inventory_dollars"] = market_exposure
+            market_data[ticker]["yes_inventory_contracts"] = position
         elif position < 0:
-            market_data[ticker]['no_inventory_dollars'] = market_exposure
-            market_data[ticker]['no_inventory_contracts'] = abs(position)
+            market_data[ticker]["no_inventory_dollars"] = market_exposure
+            market_data[ticker]["no_inventory_contracts"] = abs(position)
     
-    # Process resting orders
+    # Process resting orders (fixed-point only: remaining_count_fp, yes_price_dollars, no_price_dollars)
     for order in orders:
-        status = get_attr(order, 'status')
-        ticker = get_attr(order, 'ticker') or get_attr(order, 'market_ticker')
-        side = get_attr(order, 'side')
-        action = get_attr(order, 'action')
-        remaining = get_attr(order, 'remaining_count', 0)
-        order_id = get_attr(order, 'order_id')
-        yes_price = get_attr(order, 'yes_price', 0)
-        no_price = get_attr(order, 'no_price', 0)
-        
-        if status != 'resting' or not ticker or remaining == 0:
+        status = get_attr(order, "status")
+        ticker = get_attr(order, "ticker") or get_attr(order, "market_ticker")
+        side = (get_attr(order, "side") or "").lower()
+        action = (get_attr(order, "action") or "").lower()
+        remaining = _parse_count(get_attr(order, "remaining_count_fp") or get_attr(order, "remaining_count"))
+        order_id = get_attr(order, "order_id")
+        yes_price_dollars = _parse_price_dollars(get_attr(order, "yes_price_dollars"))
+        no_price_dollars = _parse_price_dollars(get_attr(order, "no_price_dollars"))
+        # Fallback: legacy yes_price/no_price in cents (1-100)
+        if yes_price_dollars <= 0:
+            yes_cents = get_attr(order, "yes_price", None)
+            if yes_cents is not None:
+                try:
+                    yes_price_dollars = Decimal(str(yes_cents)) / 100
+                except (TypeError, ValueError):
+                    pass
+        if no_price_dollars <= 0:
+            no_cents = get_attr(order, "no_price", None)
+            if no_cents is not None:
+                try:
+                    no_price_dollars = Decimal(str(no_cents)) / 100
+                except (TypeError, ValueError):
+                    pass
+        # Derive missing price from complement (yes + no = 1)
+        if yes_price_dollars <= 0 and no_price_dollars > 0:
+            yes_price_dollars = Decimal("1") - no_price_dollars
+        if no_price_dollars <= 0 and yes_price_dollars > 0:
+            no_price_dollars = Decimal("1") - yes_price_dollars
+
+        if status != "resting" or not ticker or remaining == 0:
             continue
-        
+        if side not in ("yes", "no") or action not in ("buy", "sell"):
+            continue
+        if side == "yes" and yes_price_dollars <= 0:
+            continue
+        if side == "no" and no_price_dollars <= 0:
+            continue
+
         if ticker not in market_data:
             market_data[ticker] = init_market()
-        
-        # Price for this order side; effective price for sells (YES sell = NO buy at 100-yes_price)
-        price = yes_price if side == 'yes' else no_price
-        order_dollars = remaining * price
-        
+
+        price_dollars = yes_price_dollars if side == "yes" else no_price_dollars
+        order_dollars_cents = int(remaining * float(price_dollars) * 100)
+
         # Calculate contracts ahead
         raw_ob = raw_orderbooks.get(ticker)
         bbo = orderbooks.get(ticker)
-        # API returns 1-indexed position (1 = first), convert to 0-indexed contracts ahead
         api_queue_pos = queue_lookup.get(order_id, 0)
         queue_pos = max(0, api_queue_pos - 1) if api_queue_pos > 0 else 0
-        contracts_at_better = get_contracts_ahead(raw_ob, side, action, price, bbo) if raw_ob and bbo else 0
+        contracts_at_better = get_contracts_ahead(raw_ob, side, action, price_dollars, bbo) if raw_ob and bbo else 0
         total_ahead = contracts_at_better + queue_pos
-        
+
         # Track queue by EFFECTIVE side (YES SELL → NO Q, NO SELL → YES Q)
-        effective_side = side if action == 'buy' else ('no' if side == 'yes' else 'yes')
-        
-        if effective_side == 'yes':
-            market_data[ticker]['yes_queue_positions'].append(total_ahead)
+        effective_side = side if action == "buy" else ("no" if side == "yes" else "yes")
+
+        if effective_side == "yes":
+            market_data[ticker]["yes_queue_positions"].append(total_ahead)
         else:
-            market_data[ticker]['no_queue_positions'].append(total_ahead)
-        
+            market_data[ticker]["no_queue_positions"].append(total_ahead)
+
         # Exposure: treat SELL YES same as BUY NO, SELL NO same as BUY YES.
-        # Resting buys add exposure; resting sells add equivalent exposure (will fill as market moves).
-        if action == 'buy':
-            if side == 'yes':
-                market_data[ticker]['yes_resting_buy_dollars'] += order_dollars
-                market_data[ticker]['yes_resting_buy_contracts'] += remaining
+        # yes_resting_buy_dollars/no_resting_buy_dollars are stored in cents for calculate_net_risk.
+        if action == "buy":
+            if side == "yes":
+                market_data[ticker]["yes_resting_buy_dollars"] += order_dollars_cents
+                market_data[ticker]["yes_resting_buy_contracts"] += remaining
             else:
-                market_data[ticker]['no_resting_buy_dollars'] += order_dollars
-                market_data[ticker]['no_resting_buy_contracts'] += remaining
-        elif action == 'sell':
-            # YES sell = NO buy at (100 - yes_price); NO sell = YES buy at (100 - no_price)
-            if side == 'yes':
-                effective_no_price = no_price if no_price else (100 - yes_price)
-                sell_dollars = remaining * effective_no_price
-                market_data[ticker]['no_resting_buy_dollars'] += sell_dollars
-                market_data[ticker]['no_resting_buy_contracts'] += remaining
+                market_data[ticker]["no_resting_buy_dollars"] += order_dollars_cents
+                market_data[ticker]["no_resting_buy_contracts"] += remaining
+        elif action == "sell":
+            # YES sell = NO buy at (1 - yes_price); NO sell = YES buy at (1 - no_price)
+            effective_price = Decimal("1") - price_dollars
+            sell_dollars_cents = int(remaining * float(effective_price) * 100)
+            if side == "yes":
+                market_data[ticker]["no_resting_buy_dollars"] += sell_dollars_cents
+                market_data[ticker]["no_resting_buy_contracts"] += remaining
             else:
-                effective_yes_price = yes_price if yes_price else (100 - no_price)
-                sell_dollars = remaining * effective_yes_price
-                market_data[ticker]['yes_resting_buy_dollars'] += sell_dollars
-                market_data[ticker]['yes_resting_buy_contracts'] += remaining
+                market_data[ticker]["yes_resting_buy_dollars"] += sell_dollars_cents
+                market_data[ticker]["yes_resting_buy_contracts"] += remaining
     
     # Add BBO data
     for ticker in market_data:
@@ -1004,33 +1092,53 @@ def calculate_exposure(positions_resp, orders_list, queue_lookup, orderbooks=Non
 
 
 def calculate_bbo(orderbook_json: dict):
-    """Calculate Best Bid/Offer from raw orderbook JSON response."""
-    orderbook = (orderbook_json or {}).get('orderbook', {})
+    """
+    Calculate Best Bid/Offer from raw orderbook JSON response.
+    Prefers orderbook_fp for fixed-point/sub-penny. Returns both cents (display) and dollars (precision).
+    """
+    orderbook = _get_orderbook(orderbook_json or {})
     if not orderbook:
         return None
-    
-    def best_bid(side_data):
+
+    def best_bid_dollars(side_data):
         if not side_data:
-            return 0
-        try:
-            prices = [float(level[0]) * 100 for level in side_data if level and len(level) >= 2]
-            return int(max(prices)) if prices else 0
-        except (ValueError, TypeError, IndexError) as e:
-            logger.debug(f"BBO price parse error: {e}")
-            return 0
-    
-    yes_bid = best_bid(orderbook.get('yes_dollars'))
-    no_bid = best_bid(orderbook.get('no_dollars'))
-    
-    if yes_bid == 0 and no_bid == 0:
+            return Decimal("0")
+        prices = []
+        for level in side_data:
+            if not level or len(level) < 2:
+                continue
+            try:
+                p = _parse_price_dollars(level[0])
+                if p > 0:
+                    prices.append(p)
+            except (ValueError, TypeError, IndexError):
+                continue
+        return max(prices) if prices else Decimal("0")
+
+    yes_bid_dollars = best_bid_dollars(orderbook.get("yes_dollars"))
+    no_bid_dollars = best_bid_dollars(orderbook.get("no_dollars"))
+
+    if yes_bid_dollars == 0 and no_bid_dollars == 0:
         return None
-    
-    yes_ask = 100 - no_bid if no_bid > 0 else 100
+
+    yes_ask_dollars = Decimal("1") - no_bid_dollars if no_bid_dollars > 0 else Decimal("1")
+    spread_dollars = yes_ask_dollars - yes_bid_dollars if yes_bid_dollars > 0 and no_bid_dollars > 0 else Decimal("0")
+
+    # Cents for display (GUI expects bid/ask/spread in cents)
+    yes_bid_cents = float(yes_bid_dollars * 100)
+    yes_ask_cents = float(yes_ask_dollars * 100)
+    no_bid_cents = float(no_bid_dollars * 100)
+    spread_cents = float(spread_dollars * 100)
+
     return {
-        'yes_bid': yes_bid,
-        'yes_ask': yes_ask,
-        'no_bid': no_bid,
-        'spread': yes_ask - yes_bid if yes_bid > 0 and no_bid > 0 else 0
+        "yes_bid": yes_bid_cents,
+        "yes_ask": yes_ask_cents,
+        "no_bid": no_bid_cents,
+        "spread": spread_cents,
+        "yes_bid_dollars": yes_bid_dollars,
+        "yes_ask_dollars": yes_ask_dollars,
+        "no_bid_dollars": no_bid_dollars,
+        "spread_dollars": spread_dollars,
     }
 
 
@@ -1065,22 +1173,19 @@ def calculate_net_risk(data: dict) -> int:
     no_buy_cost = data['no_resting_buy_dollars']
     
     # Add fees to resting orders (fees not included in inventory cost)
-    # Fee formula: 0.0175 × C × P × (1-P) where P is price in dollars, C is contracts
-    # Fees are rounded up
+    # Maker fee formula: round_up(0.0175 × C × P × (1-P)); P in dollars, C = contracts
     if yes_buy_contracts > 0:
-        # Average price per contract in dollars (cost is in cents)
-        avg_yes_price_dollars = (yes_buy_cost / yes_buy_contracts) / 100
-        # Fee = 0.0175 × contracts × price × (1 - price), rounded up
-        yes_fee_cents = math.ceil(0.0175 * yes_buy_contracts * avg_yes_price_dollars * (1 - avg_yes_price_dollars) * 100)
+        avg_yes_price_dollars = Decimal(str(yes_buy_cost)) / 100 / yes_buy_contracts
+        yes_fee_dollars = Decimal("0.0175") * yes_buy_contracts * avg_yes_price_dollars * (Decimal("1") - avg_yes_price_dollars)
+        yes_fee_cents = math.ceil(float(yes_fee_dollars * 100))
         yes_buy_cost_with_fees = yes_buy_cost + yes_fee_cents
     else:
         yes_buy_cost_with_fees = yes_buy_cost
-    
+
     if no_buy_contracts > 0:
-        # Average price per contract in dollars (cost is in cents)
-        avg_no_price_dollars = (no_buy_cost / no_buy_contracts) / 100
-        # Fee = 0.0175 × contracts × price × (1 - price), rounded up
-        no_fee_cents = math.ceil(0.0175 * no_buy_contracts * avg_no_price_dollars * (1 - avg_no_price_dollars) * 100)
+        avg_no_price_dollars = Decimal(str(no_buy_cost)) / 100 / no_buy_contracts
+        no_fee_dollars = Decimal("0.0175") * no_buy_contracts * avg_no_price_dollars * (Decimal("1") - avg_no_price_dollars)
+        no_fee_cents = math.ceil(float(no_fee_dollars * 100))
         no_buy_cost_with_fees = no_buy_cost + no_fee_cents
     else:
         no_buy_cost_with_fees = no_buy_cost
@@ -1211,23 +1316,14 @@ def save_volume_display_cache(rows: list) -> None:
 def _market_price_to_dollars(mkt: dict) -> float:
     """
     Get last-trade price in dollars from market dict.
-    Prefer last_price_dollars (fixed-point string); fallback last_price (cents or dollars).
-    Used for 24h $ estimate (volume_24h × price). Return 0.5 if missing.
+    Fixed-point only: last_price_dollars (e.g. '0.5600'). Return 0.5 if missing.
     """
     v = mkt.get("last_price_dollars")
     if v is not None and v != "":
         try:
-            return float(v)
-        except (TypeError, ValueError):
-            pass
-    v = mkt.get("last_price")
-    if v is not None:
-        try:
             x = float(v)
-            if 0 < x <= 1:
+            if 0 <= x <= 1:
                 return x
-            if 1 < x <= 100:
-                return x / 100.0
         except (TypeError, ValueError):
             pass
     return 0.5
@@ -1268,7 +1364,7 @@ def build_volume_data(tickers: list, market_data: dict = None) -> dict:
             vol_1m, vol_10m, vol_1h, vol_6h, vol_12h = live_1m, live_10m, live_1h, live_6h, live_12h
 
         mkt = market_data.get(ticker, {})
-        volume_24h = mkt.get("volume_24h", 0) or 0
+        volume_24h = _parse_count(mkt.get("volume_24h_fp"))
         price_dollars = _market_price_to_dollars(mkt)
         volume_24h_dollars = int(round(volume_24h * price_dollars * 100))  # store cents for GUI
 
@@ -1338,9 +1434,9 @@ async def fetch_dashboard_data(http_session: aiohttp.ClientSession) -> dict:
 
     positions = get_positions_list(positions_resp)
     tickers_with_positions = [
-        getattr(p, "ticker", None)
+        get_attr(p, "ticker", None)
         for p in positions
-        if getattr(p, "ticker", None) and (getattr(p, "position", 0) or 0) != 0
+        if get_attr(p, "ticker", None) and _parse_count(get_attr(p, "position_fp")) != 0
     ]
     open_count = len(tickers_with_positions)
     order_tickers = list(set(
